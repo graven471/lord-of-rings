@@ -1,7 +1,11 @@
-#include <stdint.h>
+#include <assert.h>
+#include <errno.h>
+#include <stdatomic.h>
+#include <string.h>
 #define _GNU_SOURCE
 
 #include <linux/io_uring.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
@@ -84,89 +88,189 @@ want to avoid calling io_uring_enter(2), you have the option of setting up
 Submission Queue Polling.
  */
 
-int main(void) {
-  printf("io_uring the lord of all rings\n");
+#define RING_PTR(base, offset) ((uint32_t *)((char *)(base) + (offset)))
 
-  struct io_uring_params params = {
-      // with this flag a kernel thread is created to perform submission queue
-      // polling.
-      // an io_uring instance configures in this way enables application to
-      // issue I/O without
-      // ever context switching into kernel y using the submission queue to fill
-      // in new submission queue entries and watching for
-      // completions on the completion queue, the application can submit and
-      // reap I/Os without doing a single system call.
-      // NOTE:  when using a ring setup with IORING_SETUP_SQPOLL, you never
-      // directly call the io_uring_enter(2) system call.
-      .flags = IORING_SETUP_SQPOLL,
-  };
+// io_uring(7) man page example
+#define io_uring_smp_store_release(p, v) atomic_store_explicit((_Atomic typeof(*(p)) *)(p), (v), memory_order_release)
+#define io_uring_smp_load_acquire(p) atomic_load_explicit((_Atomic typeof(*(p)) *)(p), memory_order_acquire)
+#define io_uring_smp_load_relaxed(p) atomic_load_explicit((_Atomic typeof(*(p)) *)(p), memory_order_relaxed)
 
-  // 32 is sq_entries
-  int ring_fd = syscall(SYS_io_uring_setup, 32, &params);
+struct uring_context {
+	int ring_fd;
 
-  if (ring_fd < 0) {
-    perror("io_uring_setup");
-    exit(1);
-  }
+	void *sq_ring;
+	void *cq_ring;
+	struct io_uring_sqe *sqes;
+	struct io_uring_cqe *cqes;
 
-  // params is filled in by kernel, params.sq_off, params.cq_off,
-  // params.features
+	uint32_t *sq_head;
+	uint32_t *sq_tail;
+	uint32_t *sq_ring_mask;
+	uint32_t *sq_array;
+	uint32_t *sq_flags;
 
-  printf("lord_of_ring fd = %d\n", ring_fd);
+	uint32_t *cq_head;
+	uint32_t *cq_tail;
+	uint32_t *cq_ring_mask;
+};
 
-  // Taken together, sq_entries and sq_off provide all of the information
-  // necessary for accessing the submission queue ring buffer and the
-  // submission queue entry array.
+/*
+ * tries to create uring_context
+ *
+ * return:
+ *
+ * NULL -> if anything failed
+ * uring_context* -> if succeed
+ */
+static struct uring_context *uring_context_create(unsigned entries, struct io_uring_params *params)
+{
+	if (entries == 0 || params == NULL)
+		return NULL;
 
-  // the addition of params.sq_off.array to the length of the region accounts
-  // for the fact that the ring is located at the end of the data structure.
-  void *sq_ring =
-      mmap(0, params.sq_off.array + params.sq_entries * sizeof(uint32_t),
-           PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd,
-           IORING_OFF_SQ_RING);
+	long ring_fd = syscall(SYS_io_uring_setup, entries, params);
 
-  void *cq_ring = mmap(
-      0, params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe),
-      PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, ring_fd,
-      IORING_OFF_CQ_RING);
+	if (ring_fd < 0) {
+		perror("syscall");
+		return NULL;
+	}
 
-  void *sq_entries = mmap(0, params.sq_entries * sizeof(struct io_uring_sqe),
-                          PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-                          ring_fd, IORING_OFF_SQES);
+	const size_t sq_ring_size = params->sq_off.array + params->sq_entries * sizeof(uint32_t);
+	const size_t cq_ring_size = params->cq_off.cqes + params->cq_entries * sizeof(struct io_uring_cqe);
+	const size_t sq_entries_size = params->sq_entries * sizeof(struct io_uring_sqe);
+	const size_t cq_entries_size = params->cq_entries * sizeof(struct io_uring_cqe);
 
-  if (params.features & IORING_FEAT_SINGLE_MMAP) {
-    // in this case we can combine SQ and CQ ring into one mmap
-    // instead of two conceptually
-    // [ mapping start ]
-    // sq_off.head, sq_off.tail, sq_off.ring_mask ...  ← SQ control
-    // ...
-    // cq_off.head, cq_off.tail, cq_off.ring_mask ...  ← CQ control
-    // cq_off.cqes ...                                  ← CQE structs live here
-    // too [ mapping end ]
-    printf("can combine sq_ and cq_ ring into one\n");
-  }
+	assert(sq_ring_size > 0 || cq_ring_size > 0 || sq_entries_size > 0 || cq_entries_size > 0);
 
-  // The  head  and tail track the ring buffer state. The tail is incremented by
-  // the application when submitting new I/O, and the head is incremented by the
-  // kernel when the I/O has been successfully submitted.
-  // we can access head ptr using head = (char*) sq_ring + params.sq_off.head
+	struct uring_context *context = malloc(sizeof(struct uring_context));
 
-  if (sq_ring == NULL || cq_ring == NULL || sq_entries == NULL) {
-    close(ring_fd);
-    perror("mmap");
-    exit(1);
-  }
+	if (context == NULL) {
+		close(ring_fd);
+		return NULL;
+	}
 
-  close(ring_fd);
-  // TODO: man page says: Closing the file descriptor returned by
-  // io_uring_setup(2) will free all resources associated with the io_uring
-  // context. Note that this  may  happen  asynchronously within the kernel, so
-  // it is not guaranteed that resources are freed immediately.
+	context->ring_fd = ring_fd;
 
-  // munmap(sq_ring, params.sq_off.array + params.sq_entries *
-  // sizeof(uint32_t)); munmap(cq_ring,
-  //        params.cq_off.cqes + params.cq_entries * sizeof(struct
-  //        io_uring_cqe));
+	// TODO: handle this
+	if (params->features & IORING_FEAT_SINGLE_MMAP) {
+		// in this case we can combine SQ and CQ ring into one mmap
+		// instead of two conceptually
+		// [ mapping start ]
+		// sq_off.head, sq_off.tail, sq_off.ring_mask ...  ← SQ control
+		// ...
+		// cq_off.head, cq_off.tail, cq_off.ring_mask ...  ← CQ control
+		// cq_off.cqes ...                                  ← CQE structs live here
+		// too [ mapping end ]
+	}
 
-  return 0;
+	const int default_prot = PROT_READ | PROT_WRITE;
+	const int default_flags = MAP_SHARED | MAP_POPULATE;
+
+	// this is submission queue we will use this to define I/O operations
+	// we will write to tail kernel will read head
+	// we are producer kernel is consumer
+	context->sq_ring = mmap(0, sq_ring_size, default_prot, default_flags, ring_fd, IORING_OFF_SQ_RING);
+	// this is completion ring kernel writes to it once it completed a request
+	// kernel writes to tail we will read head
+	// we are consumer kernel is producer
+	context->cq_ring = mmap(0, cq_ring_size, default_prot, default_flags, ring_fd, IORING_OFF_CQ_RING);
+	// submission queues entries array we will this up when we want to do some I/O
+	context->sqes = mmap(0, sq_entries_size, default_prot, default_flags, ring_fd, IORING_OFF_SQES);
+
+	// cqes = cq_ptr + p.cq_off.cqes;
+	context->cqes = (struct io_uring_cqe *)((char *)context->cq_ring + params->cq_off.cqes);
+
+	if (context->sq_ring == MAP_FAILED || context->cq_ring == MAP_FAILED || context->sqes == MAP_FAILED) {
+		close(ring_fd);
+		perror("mmap");
+		return NULL;
+	}
+
+	context->sq_ring_mask = RING_PTR(context->sq_ring, params->sq_off.ring_mask);
+	context->sq_array = RING_PTR(context->sq_ring, params->sq_off.array);
+	context->sq_flags = RING_PTR(context->sq_ring, params->sq_off.flags);
+
+	context->cq_head = RING_PTR(context->cq_ring, params->cq_off.head);
+	context->cq_tail = RING_PTR(context->cq_ring, params->cq_off.tail);
+	context->cq_ring_mask = RING_PTR(context->cq_ring, params->cq_off.ring_mask);
+
+	return context;
+}
+
+static void uring_context_destroy(struct uring_context *ctx)
+{
+	if (ctx == NULL)
+		return;
+
+	close(ctx->ring_fd);
+	free(ctx);
+}
+
+int main(void)
+{
+	printf("io_uring the lord of all rings\n");
+
+	struct io_uring_params params = {
+		.flags = IORING_SETUP_SQPOLL,
+	};
+
+	struct uring_context *ring_ctx = uring_context_create(32, &params);
+
+	if (ring_ctx == NULL) {
+		fprintf(stderr, "failed to create uring context\n");
+		exit(1);
+	}
+
+	// todo: abstract this into something like uring_context_sumbit
+	uint32_t sq_tail = *ring_ctx->sq_tail;
+	// sq_ring_mask is usually capacity - 1
+	uint32_t index = sq_tail & *ring_ctx->sq_ring_mask;
+
+	struct io_uring_sqe *sqe = &ring_ctx->sqes[index];
+
+	memset(sqe, 0, sizeof(*sqe));
+
+	sqe->opcode = IORING_OP_NOP;
+	sqe->user_data = 0x1234;
+
+	ring_ctx->sq_array[index] = index;
+
+	/*
+     * everything above this point will become visible to anyone who use store_acquire
+     * forms the first half of happens-before
+     */
+	io_uring_smp_store_release(ring_ctx->sq_tail, sq_tail + 1);
+
+	uint32_t sq_flags = io_uring_smp_load_acquire(ring_ctx->sq_flags);
+
+	// if this bit is set then call io_uring_enter() with IORING_ENTER_SQ_WAKEUP to wake the kernel thread
+	if (sq_flags & IORING_SQ_NEED_WAKEUP) {
+		long ret = syscall(SYS_io_uring_enter, ring_ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0);
+		printf("wakeup ret=%ld errno=%d\n", ret, errno);
+	}
+
+	for (;;) {
+		// we don't need any synchronization for head here just need atomicity guarantee
+		uint32_t head = io_uring_smp_load_relaxed(ring_ctx->cq_head);
+		// this synchronizes with kernel smp_release it does it after writing cqe response
+		uint32_t tail = io_uring_smp_load_acquire(ring_ctx->cq_tail);
+
+		// since this is a ring-buffer we know head == tail means ring is empty
+		if (head == tail)
+			continue;
+
+		uint32_t index = head & *ring_ctx->cq_ring_mask;
+		struct io_uring_cqe *cqe = &ring_ctx->cqes[index];
+
+		printf("user_data = 0x%llx\n", cqe->user_data);
+		printf("res       = %d\n", cqe->res);
+		printf("flags     = %u\n", cqe->flags);
+
+		// kernel acquires this we are saying to kernel we read this response
+		// this synchronizes-with kernel's acquire
+		io_uring_smp_store_release(ring_ctx->cq_head, head + 1);
+	}
+
+	uring_context_destroy(ring_ctx);
+
+	return 0;
 }
