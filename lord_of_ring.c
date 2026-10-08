@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 #include <assert.h>
-#include <errno.h>
 #include <stdatomic.h>
 #include <string.h>
 #include <stdbool.h>
@@ -43,14 +42,6 @@ struct uring_context {
 	uint32_t *cq_ring_mask;
 };
 
-/*
- * tries to create uring_context
- *
- * return:
- *
- * NULL -> if anything failed
- * uring_context* -> if succeed
- */
 static struct uring_context *uring_context_create(unsigned entries, struct io_uring_params *params)
 {
 	if (entries == 0 || params == NULL)
@@ -166,7 +157,6 @@ static int uring_context_submit(struct uring_context *ctx)
 		return -1;
 
 	uint64_t tail = *ctx->sq_tail;
-
 	uint64_t index = tail & *ctx->sq_ring_mask;
 	ctx->sq_array[index] = index;
 
@@ -174,6 +164,49 @@ static int uring_context_submit(struct uring_context *ctx)
 	io_uring_smp_store_release(ctx->sq_tail, tail + 1);
 
 	return 0;
+}
+
+static struct io_uring_cqe *uring_context_cq_peek(struct uring_context *ctx)
+{
+	if (ctx == NULL)
+		return NULL;
+
+	uint32_t sq_flags = io_uring_smp_load_acquire(ctx->sq_flags);
+
+	// if this bit is set then call io_uring_enter() with IORING_ENTER_SQ_WAKEUP to wake the kernel thread
+	if (sq_flags & IORING_SQ_NEED_WAKEUP) {
+		if (syscall(SYS_io_uring_enter, ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0) != 0) {
+			perror("syscall");
+			return NULL;
+		}
+	}
+
+	// here kernel updates the tail of cq_ring when it writes response and it did release
+	// so we have to do acquire
+	uint32_t cq_tail = io_uring_smp_load_acquire(ctx->cq_tail);
+
+	// we don't need any synchronization for head because kernel does not touches it
+	// we will write head we just need to preserve atomicity
+	uint32_t cq_head = io_uring_smp_load_relaxed(ctx->cq_head);
+
+	// since this is a ring buffer we know head == tail means buffer is empty
+	// todo: instead of returning null should i wait for response ?
+	if (cq_head == cq_tail) {
+		return NULL;
+	}
+
+	unsigned index = cq_head & *ctx->cq_ring_mask;
+	struct io_uring_cqe *cqe = &ctx->cqes[index];
+
+	return cqe;
+}
+
+static void uring_context_cq_consume(struct uring_context *ctx)
+{
+	uint32_t cq_head = io_uring_smp_load_relaxed(ctx->cq_head);
+	// we are saying the kernel hey we have read this response
+	// kernel is doing acquire on cq_head
+	io_uring_smp_store_release(ctx->cq_head, cq_head + 1);
 }
 
 static void uring_context_destroy(struct uring_context *ctx)
@@ -231,34 +264,32 @@ int main(void)
 		goto error;
 	}
 
-	uint32_t sq_flags = io_uring_smp_load_acquire(ring_ctx->sq_flags);
-
-	// if this bit is set then call io_uring_enter() with IORING_ENTER_SQ_WAKEUP to wake the kernel thread
-	if (sq_flags & IORING_SQ_NEED_WAKEUP) {
-		long ret = syscall(SYS_io_uring_enter, ring_ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0);
-		printf("wakeup ret=%ld errno=%d\n", ret, errno);
-	}
-
+	// todo: for now spin is fine but later i should check for new response in efficient
+	// instead of just spinning
 	for (;;) {
-		// we don't need any synchronization for head here just need atomicity guarantee
-		uint32_t head = io_uring_smp_load_relaxed(ring_ctx->cq_head);
-		// this synchronizes with kernel smp_release it does it after writing cqe response
-		uint32_t tail = io_uring_smp_load_acquire(ring_ctx->cq_tail);
+		struct io_uring_cqe *cqe = uring_context_cq_peek(ring_ctx);
 
-		// since this is a ring-buffer we know head == tail means ring is empty
-		if (head == tail)
+		if (cqe == NULL) {
 			continue;
-
-		uint32_t index = head & *ring_ctx->cq_ring_mask;
-		struct io_uring_cqe *cqe = &ring_ctx->cqes[index];
+		}
 
 		printf("user_data = 0x%llx\n", cqe->user_data);
 		printf("res       = %d\n", cqe->res);
 		printf("flags     = %u\n", cqe->flags);
 
-		// kernel acquires this we are saying to kernel we read this response
-		// this synchronizes-with kernel's acquire
-		io_uring_smp_store_release(ring_ctx->cq_head, head + 1);
+		uring_context_cq_consume(ring_ctx);
+
+		struct io_uring_cqe *cqe1 = uring_context_cq_peek(ring_ctx);
+
+		if (cqe1 == NULL) {
+			continue;
+		}
+
+		printf("user_data = 0x%llx\n", cqe1->user_data);
+		printf("res       = %d\n", cqe1->res);
+		printf("flags     = %u\n", cqe1->flags);
+
+		uring_context_cq_consume(ring_ctx);
 	}
 
 	uring_context_destroy(ring_ctx);
