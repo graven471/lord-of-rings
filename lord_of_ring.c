@@ -3,6 +3,9 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <stdbool.h>
+#include <asm/unistd_64.h>
+#include <bits/pthreadtypes.h>
+#include <errno.h>
 
 #include <linux/io_uring.h>
 #include <stdint.h>
@@ -12,6 +15,22 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define CPU_RELAX() _mm_pause()
+
+#elif defined(__aarch64__) || defined(__arm__)
+#define CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+
+#elif defined(__riscv)
+#define CPU_RELAX() __asm__ __volatile__("" ::: "memory")
+
+#else
+#define CPU_RELAX() __asm__ __volatile__("" ::: "memory")
+#endif
 
 #define RING_PTR(base, offset) ((uint32_t *)((char *)(base) + (offset)))
 
@@ -156,9 +175,8 @@ static int uring_context_submit(struct uring_context *ctx)
 	if (ctx == NULL)
 		return -1;
 
-	uint64_t tail = *ctx->sq_tail;
+	uint32_t tail = io_uring_smp_load_acquire(ctx->sq_tail);
 	uint64_t index = tail & *ctx->sq_ring_mask;
-	ctx->sq_array[index] = index;
 
 	// we are producer so we will write to tail and do smp_release
 	io_uring_smp_store_release(ctx->sq_tail, tail + 1);
@@ -175,7 +193,7 @@ static struct io_uring_cqe *uring_context_cq_peek(struct uring_context *ctx)
 
 	// if this bit is set then call io_uring_enter() with IORING_ENTER_SQ_WAKEUP to wake the kernel thread
 	if (sq_flags & IORING_SQ_NEED_WAKEUP) {
-		if (syscall(SYS_io_uring_enter, ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0) != 0) {
+		if (syscall(__NR_io_uring_enter, ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0) != 0) {
 			perror("syscall");
 			return NULL;
 		}
@@ -186,7 +204,8 @@ static struct io_uring_cqe *uring_context_cq_peek(struct uring_context *ctx)
 	uint32_t cq_tail = io_uring_smp_load_acquire(ctx->cq_tail);
 
 	// we don't need any synchronization for head because kernel does not touches it
-	// we will write head we just need to preserve atomicity
+	// only us userspace update it kernel just reads it
+	// we just need to preserve atomicity
 	uint32_t cq_head = io_uring_smp_load_relaxed(ctx->cq_head);
 
 	// since this is a ring buffer we know head == tail means buffer is empty
@@ -214,8 +233,97 @@ static void uring_context_destroy(struct uring_context *ctx)
 	if (ctx == NULL)
 		return;
 
+	// todo: should i unmap rings ?
+
 	close(ctx->ring_fd);
 	free(ctx);
+}
+
+static atomic_uint event_count = 0;
+
+// obselete for now
+static void *uring_context_check_event(void *args)
+{
+	int ring_fd = (int)(intptr_t)args;
+	fprintf(stderr, "worker started, ring_fd=%d\n", ring_fd);
+
+	// for now wait for one event to get completed
+	long res = syscall(__NR_io_uring_enter, ring_fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+	fprintf(stderr, "io_uring_enter returned: %ld, errno: %s\n", res, strerror(errno));
+
+	if (res < 0)
+		return (void *)(intptr_t)-1;
+
+	// this thread will do release and main thread or any consuming thread
+	// will do acquire so this make sures that anything before release will be flushed
+	atomic_fetch_add_explicit(&event_count, 1, memory_order_release);
+	fprintf(stderr, "worker set event_count\n");
+
+	return NULL;
+}
+
+static int uring_context_openat(struct uring_context *ctx, const char *path, uint64_t user_data)
+{
+	struct io_uring_sqe *sqe = uring_context_get_sqe(ctx);
+
+	if (sqe == NULL)
+		return -1;
+
+	sqe->opcode = IORING_OP_OPENAT;
+	sqe->fd = AT_FDCWD;
+	sqe->addr = (uintptr_t)path;
+	// todo: support flags
+	sqe->open_flags = O_RDONLY | O_CLOEXEC;
+	sqe->user_data = user_data;
+
+	if (uring_context_submit(ctx) == -1)
+		return -1;
+
+	return 0;
+}
+static int uring_context_read(struct uring_context *ctx, int fd, void *buf, size_t len, uint64_t user_data)
+{
+	// get a sqe, submit a read op, set user_data to user_data
+
+	if (fd < 0)
+		return -1;
+
+	struct io_uring_sqe *sqe = uring_context_get_sqe(ctx);
+
+	if (sqe == NULL)
+		return -1;
+
+	sqe->opcode = IORING_OP_READ;
+	sqe->fd = fd;
+	sqe->user_data = user_data;
+	sqe->flags = 0;
+	sqe->off = 0;
+	sqe->addr = (uintptr_t)buf;
+	sqe->len = len;
+
+	if (uring_context_submit(ctx) == -1)
+		return -1;
+
+	return 0;
+}
+
+static int uring_context_write(struct uring_context *ctx, int fd, void *buf, size_t len, uint64_t user_data)
+{
+	struct io_uring_sqe *sqe = uring_context_get_sqe(ctx);
+
+	if (sqe == NULL)
+		return -1;
+
+	sqe->opcode = IORING_OP_WRITE;
+	sqe->fd = fd;
+	sqe->addr = (uintptr_t)buf;
+	sqe->len = len;
+	sqe->user_data = user_data;
+
+	if (uring_context_submit(ctx) == -1)
+		return -1;
+
+	return 0;
 }
 
 int main(void)
@@ -224,6 +332,9 @@ int main(void)
 
 	struct io_uring_params params = {
 		.flags = IORING_SETUP_SQPOLL,
+		// todo: just a luck number for now change this later
+		// based on workload
+		.sq_thread_idle = 500,
 	};
 
 	struct uring_context *ring_ctx = uring_context_create(32, &params);
@@ -233,63 +344,58 @@ int main(void)
 		exit(1);
 	}
 
-	struct io_uring_sqe *op_nop_sqe = uring_context_get_sqe(ring_ctx);
-
-	if (op_nop_sqe == NULL) {
-		fprintf(stderr, "failed to get sqe");
+	if (uring_context_openat(ring_ctx, "/etc/os-release", 0x01) == -1) {
+		fprintf(stderr, "failed to do openat\n");
 		goto error;
 	}
 
-	op_nop_sqe->opcode = IORING_OP_NOP;
-	op_nop_sqe->user_data = 0x1234;
-
-	if (uring_context_submit(ring_ctx) == -1) {
-		fprintf(stderr, "failed to submit to uring");
-		goto error;
-	}
-
-	struct io_uring_sqe *op_nop_sqe2 = uring_context_get_sqe(ring_ctx);
-
-	if (op_nop_sqe2 == NULL) {
-		fprintf(stderr, "failed to get sqe");
-		goto error;
-	}
-
-	op_nop_sqe2->opcode = IORING_OP_NOP;
-	op_nop_sqe2->user_data = 0x5678;
-
-	// todo: how about batch submit ?
-	if (uring_context_submit(ring_ctx) == -1) {
-		fprintf(stderr, "failed to submit to uring");
-		goto error;
-	}
-
-	// todo: for now spin is fine but later i should check for new response in efficient
-	// instead of just spinning
+	char buf[4096];
+	bool done = false;
 	for (;;) {
-		struct io_uring_cqe *cqe = uring_context_cq_peek(ring_ctx);
+		// todo: replace 1000 with better algorithm
+		for (int i = 0; i < 1000; ++i) {
+			struct io_uring_cqe *cqe = uring_context_cq_peek(ring_ctx);
 
-		if (cqe == NULL) {
-			continue;
+			if (cqe == NULL) {
+				CPU_RELAX();
+				continue;
+			}
+
+			switch (cqe->user_data) {
+			case 0x01: {
+				uring_context_read(ring_ctx, cqe->res, buf, 4096, 0x02);
+				uring_context_cq_consume(ring_ctx);
+				break;
+			}
+			case 0x02: {
+				if (cqe->res < 0) {
+					fprintf(stderr, "failed to read\n");
+					goto error;
+				}
+
+				if (uring_context_write(ring_ctx, STDOUT_FILENO, buf, cqe->res, 0x03) == -1) {
+					fprintf(stderr, "failed to write\n");
+					goto error;
+				}
+
+				uring_context_cq_consume(ring_ctx);
+				done = true;
+				break;
+			}
+			case 0x03:
+				uring_context_cq_consume(ring_ctx);
+				break;
+
+			default:
+				break;
+			}
+
+			if (done)
+				break;
 		}
 
-		printf("user_data = 0x%llx\n", cqe->user_data);
-		printf("res       = %d\n", cqe->res);
-		printf("flags     = %u\n", cqe->flags);
-
-		uring_context_cq_consume(ring_ctx);
-
-		struct io_uring_cqe *cqe1 = uring_context_cq_peek(ring_ctx);
-
-		if (cqe1 == NULL) {
-			continue;
-		}
-
-		printf("user_data = 0x%llx\n", cqe1->user_data);
-		printf("res       = %d\n", cqe1->res);
-		printf("flags     = %u\n", cqe1->flags);
-
-		uring_context_cq_consume(ring_ctx);
+		syscall(__NR_io_uring_enter, ring_ctx->ring_fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0);
+		continue;
 	}
 
 	uring_context_destroy(ring_ctx);
