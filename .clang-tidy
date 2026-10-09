@@ -1,0 +1,51 @@
+---
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  performance-*,
+  portability-*,
+  -cert-err33-c,
+  -cert-msc30-c,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-reserved-identifier,
+  -bugprone-macro-parentheses,
+  -bugprone-macro-repeated-side-effects,
+  -bugprone-suspicious-include,
+  -bugprone-narrowing-conversions,
+  -performance-no-int-to-ptr,
+  -cert-dcl37-c,
+  -cert-dcl51-cpp,
+  -cert-err34-c,
+  -cert-err52-cpp,
+  -cert-err58-cpp,
+  -cert-err60-cpp,
+  -cert-msc50-cpp,
+  -cert-msc51-cpp,
+  -portability-template-virtual-member-function
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -portability-avoid-pragma-once,
+  -clang-analyzer-unix.Malloc
+
+WarningsAsErrors: ''
+
+HeaderFilterRegex: '.*'
+
+FormatStyle: file
+
+CheckOptions:
+  - key: bugprone-sizeof-expression.WarnOnSizeOfInteger
+    value: '1'
+  - key: bugprone-sizeof-expression.WarnOnSizeOfThis
+    value: '1'
+  - key: bugprone-signed-char-misuse.CharTypedefs
+    value: 'int8_t;uint8_t'
+  - key: performance-for-range-copy.WarnOnAllAutoCopies
+    value: 'true'
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.ConstantCase
+    value: UPPER_CASE
