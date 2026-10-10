@@ -15,6 +15,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_executable(lord_of_rings
     source/main.c
     source/uring/uring.c
+    source/commands/cat/cat.c
 )
 
 find_program(CLANG_TIDY_EXE NAMES clang-tidy)

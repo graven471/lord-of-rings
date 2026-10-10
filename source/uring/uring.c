@@ -106,7 +106,7 @@ WARN_UNUSED struct io_uring_sqe *uring_context_get_sqe(struct uring_context *ctx
 		return NULL;
 
 	uint32_t head = *ctx->sq_head;
-	uint32_t tail = *ctx->sq_tail;
+	uint32_t tail = io_uring_smp_load_acquire(ctx->sq_tail);
 
 	// todo: handle this instead of returning null
 	if (unlikely(!is_ring_free(ctx->sq_entries, head, tail))) {
@@ -121,35 +121,39 @@ WARN_UNUSED struct io_uring_sqe *uring_context_get_sqe(struct uring_context *ctx
 	// which SQE should the kernel consume ?
 	ctx->sq_array[index] = index;
 
+	// we are producer so we will write to tail and do smp_release
+	io_uring_smp_store_release(ctx->sq_tail, tail + 1);
+
 	return sqe;
 }
 
-int uring_context_submit(struct uring_context *ctx)
+// todo: this is not submit at this point
+int uring_context_submit(struct uring_context *ctx, uint32_t count)
 {
 	if (unlikely(ctx == NULL))
 		return -1;
 
-	uint32_t tail = io_uring_smp_load_acquire(ctx->sq_tail);
-	// we are producer so we will write to tail and do smp_release
-	io_uring_smp_store_release(ctx->sq_tail, tail + 1);
+	if (count > ctx->sq_entries)
+		return -1;
+
+	uint32_t sq_flags = io_uring_smp_load_acquire(ctx->sq_flags);
+
+	// todo: this is huring performance fix this
+	// if this bit is set then call io_uring_enter() with IORING_ENTER_SQ_WAKEUP to wake the kernel thread
+	if (sq_flags & IORING_SQ_NEED_WAKEUP) {
+		if (unlikely(syscall(__NR_io_uring_enter, ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0) < 0)) {
+			perror("syscall");
+			return -1;
+		}
+	}
 
 	return 0;
 }
 
 WARN_UNUSED struct io_uring_cqe *uring_context_cq_peek(struct uring_context *ctx)
 {
-	if (unlikely(ctx == NULL))
-		return NULL;
-
-	uint32_t sq_flags = io_uring_smp_load_acquire(ctx->sq_flags);
-
-	// if this bit is set then call io_uring_enter() with IORING_ENTER_SQ_WAKEUP to wake the kernel thread
-	if (sq_flags & IORING_SQ_NEED_WAKEUP) {
-		if (unlikely(syscall(__NR_io_uring_enter, ctx->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL, 0) != 0)) {
-			perror("syscall");
-			return NULL;
-		}
-	}
+	// if (unlikely(ctx == NULL))
+	// 	return NULL;
 
 	// here kernel updates the tail of cq_ring when it writes response and it did release
 	// so we have to do acquire
@@ -161,9 +165,12 @@ WARN_UNUSED struct io_uring_cqe *uring_context_cq_peek(struct uring_context *ctx
 	uint32_t cq_head = io_uring_smp_load_relaxed(ctx->cq_head);
 
 	// since this is a ring buffer we know head == tail means buffer is empty
-	// todo: instead of returning null should i wait for response ?
+	// we wait for atleast one event to arrive
 	if (cq_head == cq_tail) {
-		return NULL;
+		if (syscall(__NR_io_uring_enter, ctx->ring_fd, 0, 1, IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
+			perror("io_uring_enter");
+			return NULL;
+		}
 	}
 
 	unsigned index = cq_head & *ctx->cq_ring_mask;
@@ -217,19 +224,15 @@ int uring_context_openat(struct uring_context *ctx, const char *path, uint64_t u
 	sqe->open_flags = O_RDONLY | O_CLOEXEC;
 	sqe->user_data = user_data;
 
-	if (uring_context_submit(ctx) == -1)
-		return -1;
+	// if (uring_context_submit(ctx, 1) == -1)
+	// 	return -1;
 
 	return 0;
 }
 
-int uring_context_read(struct uring_context *ctx, int fd, void *buf, uint32_t len, uint64_t user_data)
+int uring_context_read(struct uring_context *ctx, int fd, void *buf, uint32_t len, uint64_t off, uint64_t user_data)
 {
 	// get a sqe, submit a read op, set user_data to user_data
-
-	if (unlikely(fd < 0))
-		return -1;
-
 	struct io_uring_sqe *sqe = uring_context_get_sqe(ctx);
 
 	if (unlikely(sqe == NULL))
@@ -239,12 +242,9 @@ int uring_context_read(struct uring_context *ctx, int fd, void *buf, uint32_t le
 	sqe->fd = fd;
 	sqe->user_data = user_data;
 	sqe->flags = 0;
-	sqe->off = 0;
+	sqe->off = off;
 	sqe->addr = (uintptr_t)buf;
 	sqe->len = len;
-
-	if (unlikely(uring_context_submit(ctx) == -1))
-		return -1;
 
 	return 0;
 }
@@ -262,8 +262,8 @@ int uring_context_write(struct uring_context *ctx, int fd, void *buf, uint32_t l
 	sqe->len = len;
 	sqe->user_data = user_data;
 
-	if (uring_context_submit(ctx) == -1)
-		return -1;
+	// if (uring_context_submit(ctx) == -1)
+	// 	return -1;
 
 	return 0;
 }

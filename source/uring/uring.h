@@ -29,10 +29,10 @@ struct uring_context {
 
 WARN_UNUSED struct uring_context *uring_context_create(unsigned entries, struct io_uring_params *params);
 WARN_UNUSED struct io_uring_sqe *uring_context_get_sqe(struct uring_context *ctx);
-int uring_context_submit(struct uring_context *ctx);
+int uring_context_submit(struct uring_context *ctx, uint32_t count);
 WARN_UNUSED struct io_uring_cqe *uring_context_cq_peek(struct uring_context *ctx);
 void uring_context_cq_consume(struct uring_context *ctx);
 int uring_context_openat(struct uring_context *ctx, const char *path, uint64_t user_data);
-int uring_context_read(struct uring_context *ctx, int fd, void *buf, uint32_t len, uint64_t user_data);
+int uring_context_read(struct uring_context *ctx, int fd, void *buf, uint32_t len, uint64_t off, uint64_t user_data);
 int uring_context_write(struct uring_context *ctx, int fd, void *buf, uint32_t len, uint64_t user_data);
 void uring_context_destroy(struct uring_context *ctx);
